@@ -81,8 +81,8 @@ Examples:
     )
     parser.add_argument(
         "--path",
-        required=True,
-        help="Path to the repository or project directory to scan",
+        default=None,
+        help="Path to repository to scan. Optional if --auth true (live-only scan)",
     )
     parser.add_argument(
         "--avoid",
@@ -120,11 +120,6 @@ def main():
     args = parse_args()
     print(BANNER)
 
-    repo_path = os.path.abspath(args.path)
-    if not os.path.isdir(repo_path):
-        print(f"[ERROR] Path does not exist or is not a directory: {repo_path}")
-        sys.exit(3)
-
     cloud_env = args.env
     auth_enabled = args.auth == "true"
     vm_enabled = args.vm == "true"
@@ -132,6 +127,23 @@ def main():
     thread_level = args.thread or "min"
     report_format = args.report
     console_mode = args.console_mode
+
+    # Determine if we need a path (static scanning) or can run live-only
+    repo_path = None
+    static_scan_enabled = False
+    
+    if args.path:
+        repo_path = os.path.abspath(args.path)
+        if not os.path.isdir(repo_path):
+            print(f"[ERROR] Path does not exist or is not a directory: {repo_path}")
+            sys.exit(3)
+        static_scan_enabled = True
+    elif not auth_enabled:
+        print("[ERROR] --path is required for static analysis. Use --auth true for live-only scanning.")
+        sys.exit(3)
+    else:
+        print("[INFO] No --path provided. Running live resource audit only (no static analysis).")
+        repo_path = os.getcwd()  # Use current dir for report naming
 
     collector = Collector()
     collector.set_metadata(
@@ -193,28 +205,33 @@ def main():
     else:
         print("\n[AUTH] Static analysis mode (no authentication required)")
 
-    # --- Phase 2: Crawl Repository ---
-    print(f"\n[SCAN] Crawling repository: {repo_path}")
-    crawler = RepoCrawler(repo_path)
-    files = crawler.crawl()
-    collector.set_metadata(files_scanned=len(files))
-    print(f"[SCAN] Found {len(files)} scannable files")
+    # --- Phase 2: Crawl Repository (skip if live-only) ---
+    files = []
+    if static_scan_enabled:
+        print(f"\n[SCAN] Crawling repository: {repo_path}")
+        crawler = RepoCrawler(repo_path)
+        files = crawler.crawl()
+        collector.set_metadata(files_scanned=len(files))
+        print(f"[SCAN] Found {len(files)} scannable files")
 
-    # --- Phase 3: Run Detectors (static analysis) ---
-    print(f"\n[DETECT] Loading {cloud_env.upper()} detection rules...")
-    detectors = load_detectors(cloud_env, avoid_categories)
-    print(f"[DETECT] Loaded {len(detectors)} detector(s), skipping: {avoid_categories or 'none'}")
+        # --- Phase 3: Run Detectors (static analysis) ---
+        print(f"\n[DETECT] Loading {cloud_env.upper()} detection rules...")
+        detectors = load_detectors(cloud_env, avoid_categories)
+        print(f"[DETECT] Loaded {len(detectors)} detector(s), skipping: {avoid_categories or 'none'}")
 
-    thread_manager = ThreadManager(thread_level)
-    print(f"[DETECT] Scanning with {thread_manager.pool_size} threads...\n")
+        thread_manager = ThreadManager(thread_level)
+        print(f"[DETECT] Scanning with {thread_manager.pool_size} threads...\n")
 
-    def run_detector(detector):
-        return detector.scan(files, collector)
+        def run_detector(detector):
+            return detector.scan(files, collector)
 
-    start = time.time()
-    thread_manager.execute(run_detector, detectors)
-    elapsed_detect = time.time() - start
-    print(f"\n[DETECT] ✓ Detection complete in {elapsed_detect:.1f}s")
+        start = time.time()
+        thread_manager.execute(run_detector, detectors)
+        elapsed_detect = time.time() - start
+        print(f"\n[DETECT] ✓ Detection complete in {elapsed_detect:.1f}s")
+    else:
+        collector.set_metadata(files_scanned=0)
+        print("\n[SCAN] Skipping static analysis (live-only mode)")
 
     # --- Phase 3b: Authenticated Live Scan (if --auth true) ---
     if auth_enabled and auth_context:
@@ -230,7 +247,7 @@ def main():
             print(f"[LIVE] No authenticated scanner available for {cloud_env}")
 
     # --- Phase 4: Vulnerability Management (CVE Fetch) ---
-    if vm_enabled:
+    if vm_enabled and static_scan_enabled:
         print("\n[CVE] Parsing dependencies for AI frameworks...")
         dep_parser = DependencyParser(repo_path)
         ai_deps = dep_parser.parse()
@@ -243,6 +260,8 @@ def main():
             print(f"[CVE] ✓ Fetched {len(cve_findings)} CVE(s)")
         else:
             print("[CVE] No AI-specific dependencies detected")
+    elif vm_enabled and not static_scan_enabled:
+        print("\n[CVE] Skipping CVE fetching (no repo path for dependency parsing)")
     else:
         print("\n[CVE] Vulnerability management disabled (--vm false)")
 
