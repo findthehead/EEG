@@ -3,10 +3,17 @@
 EEG - Extensive Exposure Guard
 Multi-Cloud AI Security & Vulnerability Management Framework
 
+Supports:
+  - Local authenticated console (az login, aws configure, gcloud auth)
+  - Cloud console bash (Azure Cloud Shell, AWS CloudShell, GCP Cloud Shell)
+  - Static code analysis
+  - Live resource auditing
+
 Usage:
   python eeg.py --env aws --path /path/to/repo --report json
   python eeg.py --env azure --auth true --path ./my-app --avoid iac,network --report html
-  python eeg.py --env gcp --vm false --thread max --report json
+  python eeg.py --env gcp --vm false --thread max --report csv
+  python eeg.py --env azure --console-mode auto --path . --report html
 """
 
 import argparse
@@ -20,7 +27,9 @@ from eeg.utils.repocrawler import RepoCrawler
 from eeg.utils.threadpoolexecutor import ThreadManager
 from eeg.utils.htmlreport import HTMLReportGenerator
 from eeg.utils.jsonreport import JSONReportGenerator
+from eeg.utils.csvreport import CSVReportGenerator
 from eeg.utils.auth import CloudAuthenticator
+from eeg.utils.cloud_console import CloudConsoleDetector, LocalConsoleAuthenticator
 from eeg.detectors import load_detectors
 from eeg.auth_scanner import get_auth_scanner
 from eeg.vuln_manager.cve_fetcher import CVEFetcher
@@ -47,7 +56,8 @@ Examples:
   %(prog)s --env aws --path ./my-bedrock-app --report json
   %(prog)s --env azure --auth true --path ./foundry-app --report html
   %(prog)s --env gcp --path ./vertex-app --avoid iac,network --vm false
-  %(prog)s --env aws --path ./app --thread max --report html
+  %(prog)s --env aws --path ./app --thread max --report csv
+  %(prog)s --env azure --console-mode auto --path . --report html
         """,
     )
 
@@ -61,7 +71,13 @@ Examples:
         "--auth",
         default="false",
         choices=["true", "false"],
-        help="Enable authenticated testing (reads cloud credentials). Default: false",
+        help="Enable live cloud resource audit (requires CLI login). Static code scanning works without this. Default: false",
+    )
+    parser.add_argument(
+        "--console-mode",
+        default="auto",
+        choices=["auto", "local", "cloud"],
+        help="Console mode: auto (detect), local (use local CLI), cloud (use cloud shell). Default: auto",
     )
     parser.add_argument(
         "--path",
@@ -88,13 +104,13 @@ Examples:
     parser.add_argument(
         "--report",
         default="json",
-        choices=["json", "html"],
-        help="Report output format. Default: json",
+        choices=["json", "html", "csv"],
+        help="Report output format: json, html, or csv. Default: json",
     )
     parser.add_argument(
         "--output-file",
         default=None,
-        help="Save report to file (default: stdout for json, eeg_report.html for html)",
+        help="Save report to file (default: auto-generated filename based on format)",
     )
 
     return parser.parse_args()
@@ -115,6 +131,7 @@ def main():
     avoid_categories = set(c.strip().lower() for c in args.avoid.split(",") if c.strip())
     thread_level = args.thread or "min"
     report_format = args.report
+    console_mode = args.console_mode
 
     collector = Collector()
     collector.set_metadata(
@@ -126,16 +143,55 @@ def main():
         thread_level=thread_level,
     )
 
-    # --- Phase 1: Authenticate (if --auth true) ---
+    # --- Phase 0: Console Mode Detection ---
     auth_context = None
-    if auth_enabled:
-        print(f"\n[AUTH] Attempting {cloud_env.upper()} credential discovery...")
-        authenticator = CloudAuthenticator(cloud_env)
-        auth_context = authenticator.authenticate()
-        if auth_context:
-            print(f"[AUTH] ✓ Authenticated as: {auth_context.get('identity', 'unknown')}")
+    console_detector = CloudConsoleDetector()
+    is_cloud_console, detected_console, cloud_shell_context = console_detector.detect()
+
+    if console_mode == "auto":
+        if is_cloud_console:
+            print(f"\n[CONSOLE] ✓ Cloud Shell detected: {detected_console.upper()}")
+            auth_context = cloud_shell_context
+            auth_enabled = True
+            collector.set_metadata(console_mode="cloud_shell", console_type=detected_console)
         else:
-            print("[AUTH] ✗ No credentials found. Proceeding with static analysis only.")
+            print("\n[CONSOLE] Local console mode (not in cloud shell)")
+            collector.set_metadata(console_mode="local")
+    elif console_mode == "cloud":
+        if is_cloud_console:
+            print(f"\n[CONSOLE] ✓ Cloud Shell mode: {detected_console.upper()}")
+            auth_context = cloud_shell_context
+            auth_enabled = True
+            collector.set_metadata(console_mode="cloud_shell", console_type=detected_console)
+        else:
+            print("[CONSOLE] ✗ Cloud shell requested but not detected")
+            collector.set_metadata(console_mode="local")
+    else:  # local
+        print("\n[CONSOLE] Local console mode (forced)")
+        collector.set_metadata(console_mode="local")
+
+    # --- Phase 1: Authenticate (if --auth true or cloud shell detected) ---
+    if auth_enabled and not auth_context:
+        # Try local CLI authentication first
+        local_auth = LocalConsoleAuthenticator(cloud_env)
+        is_authenticated, cli_context = local_auth.check_cli_auth()
+        
+        if is_authenticated:
+            print(f"\n[AUTH] ✓ CLI authenticated as: {cli_context.get('identity', 'unknown')}")
+            auth_context = cli_context
+        else:
+            # Fall back to credential file discovery
+            print(f"\n[AUTH] Attempting {cloud_env.upper()} credential discovery...")
+            authenticator = CloudAuthenticator(cloud_env)
+            auth_context = authenticator.authenticate()
+            if auth_context:
+                print(f"[AUTH] ✓ Authenticated as: {auth_context.get('identity', 'unknown')}")
+            else:
+                print("[AUTH] ✗ No credentials found. Proceeding with static analysis only.")
+    elif auth_context:
+        print(f"[AUTH] ✓ Using cloud shell credentials: {auth_context.get('identity', 'unknown')}")
+    else:
+        print("\n[AUTH] Static analysis mode (no authentication required)")
 
     # --- Phase 2: Crawl Repository ---
     print(f"\n[SCAN] Crawling repository: {repo_path}")
@@ -203,10 +259,24 @@ def main():
     print(f"  MEDIUM:   {summary['by_severity']['MEDIUM']}")
     print(f"  LOW:      {summary['by_severity']['LOW']}")
     print(f"  Duration: {summary['scan_duration_seconds']}s")
+    
+    # Show permission tracking if there were issues
+    completed = summary.get("completed_checks", 0)
+    skipped = summary.get("skipped_checks", 0)
+    perm_issues = summary.get("permission_issues", 0)
+    
+    if completed > 0 or skipped > 0:
+        print("-" * 60)
+        print(f"  Checks:   {completed} completed, {skipped} skipped")
+    if perm_issues > 0:
+        print(f"  ⚠ {perm_issues} permission issue(s) encountered")
+        print("    (Some checks skipped due to limited permissions)")
     print("=" * 60)
 
     if report_format == "json":
         generator = JSONReportGenerator(collector)
+    elif report_format == "csv":
+        generator = CSVReportGenerator(collector)
     else:
         generator = HTMLReportGenerator(collector)
 
@@ -216,7 +286,8 @@ def main():
     if output_file is None:
         app_name = os.path.basename(repo_path)
         ts = datetime.datetime.utcnow().strftime("%H-%M-%S-%d%m%Y")
-        ext = "html" if report_format == "html" else "json"
+        ext_map = {"html": "html", "json": "json", "csv": "csv"}
+        ext = ext_map.get(report_format, "json")
         output_file = f"eeg-report-{cloud_env}-{app_name}-{ts}.{ext}"
 
     if output_file:

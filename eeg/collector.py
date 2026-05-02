@@ -64,6 +64,9 @@ class Collector:
         self.scan_metadata: Dict = {}
         self._start_time = datetime.datetime.utcnow()
         self._seen_keys: set = set()
+        self.permission_issues: List[Dict] = []  # Track permission-related skips
+        self.completed_checks: List[str] = []    # Track successfully completed checks
+        self.skipped_checks: List[str] = []      # Track skipped checks
 
     def _dedup_key(self, finding: Finding) -> str:
         return f"{finding.rule_id}|{finding.file_path}|{finding.line_number}"
@@ -77,6 +80,22 @@ class Collector:
     def add_findings(self, findings: List[Finding]):
         for f in findings:
             self.add_finding(f)
+
+    def add_permission_issue(self, check_name: str, resource: str, error: str):
+        """Record a permission issue that prevented a check from running."""
+        self.permission_issues.append({
+            "check": check_name,
+            "resource": resource,
+            "error": str(error)[:200],  # Truncate long errors
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+        })
+        if check_name not in self.skipped_checks:
+            self.skipped_checks.append(check_name)
+
+    def add_completed_check(self, check_name: str):
+        """Record a successfully completed check."""
+        if check_name not in self.completed_checks:
+            self.completed_checks.append(check_name)
 
     def set_metadata(self, **kwargs):
         self.scan_metadata.update(kwargs)
@@ -95,6 +114,9 @@ class Collector:
             "files_scanned": self.scan_metadata.get("files_scanned", 0),
             "scan_duration_seconds": round(elapsed, 2),
             "scan_time": self._start_time.isoformat(),
+            "completed_checks": len(self.completed_checks),
+            "skipped_checks": len(self.skipped_checks),
+            "permission_issues": len(self.permission_issues),
         }
 
     def get_findings_sorted(self) -> List[Finding]:
@@ -115,6 +137,9 @@ class Collector:
             "metadata": self.scan_metadata,
             "summary": self.get_summary(),
             "findings": [f.to_dict() for f in self.get_findings_sorted()],
+            "completed_checks": self.completed_checks,
+            "skipped_checks": self.skipped_checks,
+            "permission_issues": self.permission_issues,
         }
 
     @property

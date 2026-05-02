@@ -77,6 +77,16 @@ class HTMLReportGenerator:
             cards += f'<div class="card"><div class="num" style="color:{color}">{count}</div><div class="label">{sev}</div></div>'
         cards += f'<div class="card"><div class="num" style="color:#38bdf8">{summary["files_scanned"]}</div><div class="label">Files Scanned</div></div>'
         cards += f'<div class="card"><div class="num" style="color:#38bdf8">{summary["scan_duration_seconds"]}s</div><div class="label">Duration</div></div>'
+        
+        # Add permission tracking info if there were issues
+        completed = summary.get("completed_checks", 0)
+        skipped = summary.get("skipped_checks", 0)
+        perm_issues = summary.get("permission_issues", 0)
+        
+        if skipped > 0 or perm_issues > 0:
+            cards += f'<div class="card"><div class="num" style="color:#22c55e">{completed}</div><div class="label">Checks Completed</div></div>'
+            cards += f'<div class="card"><div class="num" style="color:#f59e0b">{skipped}</div><div class="label">Checks Skipped</div></div>'
+        
         return f'<div class="summary-grid">{cards}</div>'
 
     def _render_findings(self, findings: list) -> str:

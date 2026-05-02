@@ -1,8 +1,8 @@
 # `EEG (Extensive Exposure Guard)`<br> MultiCloud AI Security and Vulnerability Management Framework
 ![](asset/logo.png)
 
-[![PyPI](https://img.shields.io/pypi/v/eeg-security?v=1)](https://pypi.org/project/eeg-security/)
-[![Python](https://img.shields.io/pypi/pyversions/eeg-security?v=1)](https://pypi.org/project/eeg-security/)
+[![PyPI](https://img.shields.io/pypi/v/eeg-security?v=2)](https://pypi.org/project/eeg-security/)
+[![Python](https://img.shields.io/pypi/pyversions/eeg-security?v=2)](https://pypi.org/project/eeg-security/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **AI-First Cloud Security.** In a market with hundreds of cloud security tools, none focus on AI workloads. EEG is the go-to DevSecOps tool for developers to catch AI-specific vulnerabilities before pushing to production.
@@ -10,6 +10,7 @@
 **Target:** AI-Specific Workload Security (No general cloud/infra drift)
 **Deployment:** CI/CD Integrated Pre-deployment Testing
 **Scan Modes:** Static analysis (AST + Regex) · Authenticated live audit · NVD CVE fetching
+**Console Support:** Local CLI · Azure Cloud Shell · AWS CloudShell · GCP Cloud Shell
 
 ---
 
@@ -43,6 +44,12 @@ eeg --env azure --path ./foundry-app --avoid iac,network --thread max --report h
 
 # Scan without CVE fetching (offline/air-gapped)
 eeg --env gcp --path ./vertex-app --vm false --report json
+
+# Run directly in Azure Cloud Shell (auto-detects credentials)
+eeg --env azure --console-mode auto --path . --report csv
+
+# Force cloud shell mode with CSV output
+eeg --env aws --console-mode cloud --path ./app --report csv
 ```
 
 ---
@@ -58,11 +65,24 @@ eeg --env aws/azure/gcp --path /path/to/repo [OPTIONS]
 | `--env` | `aws` `azure` `gcp` | *required* | Target cloud environment |
 | `--path` | `/path/to/repo` | *required* | Repository or project directory to scan |
 | `--auth` | `true` `false` | `false` | Enable authenticated live audit (reads cloud credentials) |
+| `--console-mode` | `auto` `local` `cloud` | `auto` | Console mode: auto-detect, force local CLI, or force cloud shell |
 | `--vm` | `true` `false` | `true` | Enable NVD CVE fetching for AI dependencies |
 | `--avoid` | `iam,storage,guardrail,model,network,iac,policy,prompt,secrets,logging` | *none* | Comma-separated categories to skip |
 | `--thread` | `med` `max` | *sequential* | Parallel scanning: `med`(4 threads), `max`(8 threads) |
-| `--report` | `json` `html` | `json` | Report output format |
+| `--report` | `json` `html` `csv` | `json` | Report output format |
 | `--output-file` | `/path/to/file` | auto-generated | Custom output path (default: `eeg-report-{env}-{app}-{timestamp}.{ext}`) |
+
+### Cloud Console Support
+
+EEG automatically detects and works in cloud shell environments:
+
+| Environment | Detection | Authentication |
+|-------------|-----------|----------------|
+| **Azure Cloud Shell** | `ACC_CLOUD`, `/home/cloudshell` | Uses existing `az login` session |
+| **AWS CloudShell** | `AWS_EXECUTION_ENV`, `AWS_CLOUDSHELL_USER_ID` | Uses IAM role attached to CloudShell |
+| **GCP Cloud Shell** | `CLOUD_SHELL`, `DEVSHELL_PROJECT_ID` | Uses Application Default Credentials |
+
+When running in a cloud shell, EEG falls back to CLI-based scanning if SDK packages aren't available, making it work out-of-the-box without additional pip installs.
 
 ---
 
@@ -78,6 +98,7 @@ eeg --env aws/azure/gcp --path /path/to/repo [OPTIONS]
 * **Prompt Exploits:** System prompt leakage, prompt injection via external data sources (indirect prompt injection), and jailbreak resistance weaknesses.
 * **Multimodal Security:** Multimodal prompt injection via image, audio, or document inputs into LLM pipelines.
 * **Guardrail Validation:** PII filtering bypass, toxicity/content moderation bypass, insecure AI guardrail configurations, missing guardrails (CRITICAL), weak filter strengths, ANONYMIZE vs BLOCK, DRAFT vs PRODUCTION versions.
+* **Default Guardrails Detection:** Checks if projects have default guardrails configured at the account/project level. This is a CRITICAL finding as it indicates fundamental AI safety is not properly configured.
 * **Agent Integrity:** AI agent tool/function calling permission abuse (excessive agency), unsafe agent memory exposure, missing human confirmation for mutating actions, and sensitive prompt/response logging.
 
 ### **III. Infrastructure & Data Security (AI-Specific)**

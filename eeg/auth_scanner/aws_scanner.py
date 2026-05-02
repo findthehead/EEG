@@ -1,10 +1,15 @@
 """
 EEG - AWS Authenticated Scanner
 Live audit of Bedrock agents, guardrails, knowledge bases, model logging,
-IAM, and network.
+IAM, and network. Supports both SDK and CLI modes for cloud shell compatibility.
+Auto-detects permissions and gracefully handles restricted access.
+"""
 
+import os
 import sys
-from typing import List, Dict, Optional
+import subprocess
+import json
+from typing import List, Dict, Optional, Tuple
 from eeg.collector import Collector, Finding, Severity
 
 try:
@@ -13,6 +18,29 @@ try:
     HAS_BOTO3 = True
 except ImportError:
     HAS_BOTO3 = False
+
+
+def _safe_cli_call(cmd: List[str], timeout: int = 30) -> Tuple[bool, str, str]:
+    """
+    Execute CLI command safely, returning (success, stdout, error_message).
+    Never raises exceptions - always returns a result tuple.
+    """
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            return True, result.stdout.strip(), ""
+        else:
+            error = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
+            # Check for common permission errors
+            if any(x in error.lower() for x in ["accessdenied", "not authorized", "forbidden", "permission"]):
+                return False, "", f"Permission denied: {error[:150]}"
+            return False, "", error[:200]
+    except subprocess.TimeoutExpired:
+        return False, "", "Command timed out"
+    except FileNotFoundError:
+        return False, "", "AWS CLI not found"
+    except Exception as e:
+        return False, "", str(e)[:150]
 
 
 def _paginate(method, result_key, **kwargs):
@@ -34,18 +62,43 @@ def _paginate(method, result_key, **kwargs):
 
 
 class AWSAuthScanner:
-    """Live audit of AWS Bedrock resources using authenticated API calls."""
+    """
+    Live audit of AWS Bedrock resources using authenticated API calls.
+    Gracefully handles permission restrictions without breaking scan flow.
+    """
 
     def __init__(self, auth_context: dict):
         self.auth_context = auth_context
         self.profile = auth_context.get("profile")
-        self.region = auth_context.get("region", "us-east-1")
+        self.region = auth_context.get("region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+        self._use_cli = auth_context.get("source") in ("aws_cli", "cloud_shell")
+        self._has_default_guardrails = False
 
     def scan(self, collector: Collector):
-        if not HAS_BOTO3:
-            print("  [AUTH-AWS] boto3 not installed — skipping authenticated scan")
+        if not HAS_BOTO3 and not self._use_cli:
+            print("  [AUTH-AWS] boto3 not installed — trying CLI fallback")
+            self._scan_with_cli(collector)
             return
 
+        if HAS_BOTO3:
+            self._scan_with_sdk(collector)
+        else:
+            self._scan_with_cli(collector)
+        
+        # Final check: Report if no default guardrails exist
+        if not self._has_default_guardrails:
+            collector.add_finding(Finding(
+                rule_id="AUTH-AWS-GUARD-DEFAULT", severity=Severity.CRITICAL,
+                category="guardrail", cloud_env="aws",
+                file_path="live:bedrock:account", line_number=0,
+                code_snippet="defaultGuardrails=NOT_CONFIGURED",
+                message="Account does NOT have default guardrails configured for Bedrock",
+                recommendation="Create at least one Bedrock guardrail with PROMPT_ATTACK, PII filters, and content moderation. Attach it to all agents and model invocations.",
+                owasp_llm="LLM01: Prompt Injection",
+            ))
+
+    def _scan_with_sdk(self, collector: Collector):
+        """Scan using boto3 SDK."""
         print("  [AUTH-AWS] Initializing AWS session...")
         session_params = {}
         if self.profile:
@@ -59,20 +112,278 @@ class AWSAuthScanner:
             identity = sts.get_caller_identity()
             account_id = identity["Account"]
             print(f"  [AUTH-AWS] Account: {account_id} | Region: {session.region_name}")
+            collector.add_completed_check("aws_sdk_auth")
+            collector.set_metadata(aws_account=account_id, aws_region=session.region_name)
         except (ClientError, NoCredentialsError) as e:
-            print(f"  [AUTH-AWS] ✗ Authentication failed: {e}")
+            collector.add_permission_issue("aws_sdk_auth", "sts:GetCallerIdentity", str(e))
+            print(f"  [AUTH-AWS] ⚠ SDK auth issue - falling back to CLI")
+            self._scan_with_cli(collector)
             return
 
-        bedrock = session.client("bedrock")
-        bedrock_agent = session.client("bedrock-agent")
-        s3 = session.client("s3")
-        iam = session.client("iam")
+        # Create clients - each check will handle its own permission errors
+        try:
+            bedrock = session.client("bedrock")
+            bedrock_agent = session.client("bedrock-agent")
+            s3 = session.client("s3")
+            iam = session.client("iam")
+        except Exception as e:
+            collector.add_permission_issue("aws_client_init", "boto3", str(e))
+            print(f"  [AUTH-AWS] ⚠ Client init issue - falling back to CLI")
+            self._scan_with_cli(collector)
+            return
 
+        # Run each check - they handle their own permissions gracefully
         self._check_guardrails(bedrock, collector)
         self._check_agents(bedrock_agent, bedrock, collector)
         self._check_knowledge_bases(bedrock_agent, s3, collector)
         self._check_model_invocation_logging(bedrock, collector)
         self._check_iam_policies(iam, collector)
+
+    def _scan_with_cli(self, collector: Collector):
+        """Scan using AWS CLI for cloud shell environments."""
+        print("  [AUTH-AWS] Using AWS CLI for resource auditing...")
+        
+        # Verify authentication
+        success, stdout, error = _safe_cli_call(["aws", "sts", "get-caller-identity", "--output", "json"])
+        
+        if not success:
+            collector.add_permission_issue("aws_cli_auth", "sts:GetCallerIdentity", error)
+            print(f"  [AUTH-AWS] ⚠ CLI auth limited - proceeding with available permissions")
+        else:
+            collector.add_completed_check("aws_cli_auth")
+            try:
+                identity = json.loads(stdout)
+                print(f"  [AUTH-AWS] Account: {identity.get('Account')} | User: {identity.get('Arn', '').split('/')[-1]}")
+                collector.set_metadata(aws_account=identity.get('Account'))
+            except json.JSONDecodeError:
+                pass
+
+        # Run checks - each handles its own permissions
+        self._check_guardrails_cli(collector)
+        self._check_agents_cli(collector)
+        self._check_logging_cli(collector)
+
+    def _check_guardrails_cli(self, collector: Collector):
+        """Check Bedrock guardrails using AWS CLI."""
+        print("  [AUTH-AWS] Auditing Bedrock guardrails (CLI)...")
+        
+        success, stdout, error = _safe_cli_call(["aws", "bedrock", "list-guardrails", "--output", "json"])
+        
+        if not success:
+            if "permission" in error.lower() or "accessdenied" in error.lower():
+                collector.add_permission_issue("list_guardrails", "bedrock:ListGuardrails", error)
+                print("  [AUTH-AWS] ⚠ No permission to list guardrails - skipping")
+            return
+        
+        collector.add_completed_check("list_guardrails")
+        
+        try:
+            data = json.loads(stdout)
+            guardrails = data.get("guardrails", [])
+            
+            if guardrails:
+                self._has_default_guardrails = True
+                print(f"  [AUTH-AWS] Found {len(guardrails)} guardrail(s)")
+                
+                for gr in guardrails:
+                    gr_id = gr.get("id", "")
+                    gr_name = gr.get("name", gr_id)
+                    self._check_guardrail_details_cli(gr_id, gr_name, collector)
+            else:
+                collector.add_finding(Finding(
+                    rule_id="AUTH-AWS-GUARD-001", severity=Severity.CRITICAL,
+                    category="guardrail", cloud_env="aws",
+                    file_path="live:bedrock:guardrails", line_number=0,
+                    code_snippet="", message="No Bedrock guardrails found in account",
+                    recommendation="Create guardrails with content filters (PROMPT_ATTACK HIGH), PII blocking, and topic denial.",
+                    owasp_llm="LLM01: Prompt Injection",
+                ))
+        except json.JSONDecodeError:
+            pass
+
+    def _check_guardrail_details_cli(self, gr_id: str, gr_name: str, collector: Collector):
+        """Check individual guardrail details via CLI."""
+        success, stdout, error = _safe_cli_call([
+            "aws", "bedrock", "get-guardrail", "--guardrail-identifier", gr_id, "--output", "json"
+        ])
+        
+        if not success:
+            if "permission" in error.lower():
+                collector.add_permission_issue(f"get_guardrail_{gr_name}", "bedrock:GetGuardrail", error)
+            return
+        
+        try:
+            detail = json.loads(stdout)
+            
+            content_policy = detail.get("contentPolicy", {})
+            filters = content_policy.get("filtersConfig", [])
+            has_prompt_attack = False
+            
+            for f in filters:
+                ftype = f.get("type", "")
+                inp = f.get("inputStrength", "NONE")
+                
+                if ftype == "PROMPT_ATTACK":
+                    has_prompt_attack = True
+                
+                if inp in ("LOW", "NONE"):
+                    collector.add_finding(Finding(
+                        rule_id="AUTH-AWS-GUARD-002", severity=Severity.HIGH,
+                        category="guardrail", cloud_env="aws",
+                        file_path=f"live:guardrail:{gr_name}", line_number=0,
+                        code_snippet=f"filter={ftype} inputStrength={inp}",
+                        message=f"Guardrail '{gr_name}' has weak {ftype} filter (inputStrength={inp})",
+                        recommendation=f"Set {ftype} inputStrength to HIGH.",
+                        owasp_llm="LLM01: Prompt Injection",
+                    ))
+            
+            if not has_prompt_attack:
+                collector.add_finding(Finding(
+                    rule_id="AUTH-AWS-GUARD-003", severity=Severity.CRITICAL,
+                    category="guardrail", cloud_env="aws",
+                    file_path=f"live:guardrail:{gr_name}", line_number=0,
+                    code_snippet="",
+                    message=f"Guardrail '{gr_name}' missing PROMPT_ATTACK content filter",
+                    recommendation="Add PROMPT_ATTACK filter with inputStrength=HIGH.",
+                    owasp_llm="LLM01: Prompt Injection",
+                ))
+        except json.JSONDecodeError:
+            pass
+
+    def _check_agents_cli(self, collector: Collector):
+        """Check Bedrock agents using AWS CLI."""
+        print("  [AUTH-AWS] Auditing Bedrock agents (CLI)...")
+        
+        success, stdout, error = _safe_cli_call(["aws", "bedrock-agent", "list-agents", "--output", "json"])
+        
+        if not success:
+            if "permission" in error.lower() or "accessdenied" in error.lower():
+                collector.add_permission_issue("list_agents", "bedrock:ListAgents", error)
+                print("  [AUTH-AWS] ⚠ No permission to list agents - skipping")
+            return
+        
+        collector.add_completed_check("list_agents")
+        
+        try:
+            data = json.loads(stdout)
+            agents = data.get("agentSummaries", [])
+            print(f"  [AUTH-AWS] Found {len(agents)} agent(s)")
+            
+            for agent in agents:
+                agent_id = agent.get("agentId", "")
+                agent_name = agent.get("agentName", agent_id)
+                self._check_agent_details_cli(agent_id, agent_name, collector)
+        except json.JSONDecodeError:
+            pass
+
+    def _check_agent_details_cli(self, agent_id: str, agent_name: str, collector: Collector):
+        """Check individual agent details via CLI."""
+        success, stdout, error = _safe_cli_call([
+            "aws", "bedrock-agent", "get-agent", "--agent-id", agent_id, "--output", "json"
+        ])
+        
+        if not success:
+            if "permission" in error.lower():
+                collector.add_permission_issue(f"get_agent_{agent_name}", "bedrock:GetAgent", error)
+            return
+        
+        try:
+            data = json.loads(stdout)
+            agent_cfg = data.get("agent", {})
+            
+            # Check guardrail attachment
+            gr_cfg = agent_cfg.get("guardrailConfiguration")
+            if not gr_cfg or not gr_cfg.get("guardrailIdentifier"):
+                collector.add_finding(Finding(
+                    rule_id="AUTH-AWS-AGENT-001", severity=Severity.CRITICAL,
+                    category="policy", cloud_env="aws",
+                    file_path=f"live:agent:{agent_name}", line_number=0,
+                    code_snippet="guardrailConfiguration: null",
+                    message=f"Agent '{agent_name}' has NO guardrail — vulnerable to prompt injection",
+                    recommendation="Attach a Bedrock guardrail with PROMPT_ATTACK filter to this agent.",
+                    owasp_llm="LLM01: Prompt Injection",
+                ))
+        except json.JSONDecodeError:
+            pass
+
+    def _check_logging_cli(self, collector: Collector):
+        """Check model invocation logging via CLI."""
+        print("  [AUTH-AWS] Auditing model invocation logging (CLI)...")
+        
+        success, stdout, error = _safe_cli_call([
+            "aws", "bedrock", "get-model-invocation-logging-configuration", "--output", "json"
+        ])
+        
+        if not success:
+            if "permission" in error.lower() or "accessdenied" in error.lower():
+                collector.add_permission_issue("get_logging_config", "bedrock:GetModelInvocationLoggingConfiguration", error)
+                print("  [AUTH-AWS] ⚠ No permission to check logging config - skipping")
+            else:
+                # Logging not configured is also an error code
+                collector.add_finding(Finding(
+                    rule_id="AUTH-AWS-LOG-001", severity=Severity.CRITICAL,
+                    category="logging", cloud_env="aws",
+                    file_path="live:bedrock:logging", line_number=0,
+                    code_snippet="",
+                    message="Model invocation logging not configured — no audit trail for AI inference",
+                    recommendation="Enable model invocation logging to S3 and CloudWatch.",
+                ))
+            return
+        
+        collector.add_completed_check("get_logging_config")
+        
+        try:
+            data = json.loads(stdout)
+            logging_cfg = data.get("loggingConfig", {})
+            
+            cw_cfg = logging_cfg.get("cloudWatchConfig", {})
+            s3_cfg = logging_cfg.get("s3Config", {})
+            
+            if not cw_cfg.get("logGroupName") and not s3_cfg.get("bucketName"):
+                collector.add_finding(Finding(
+                    rule_id="AUTH-AWS-LOG-001", severity=Severity.CRITICAL,
+                    category="logging", cloud_env="aws",
+                    file_path="live:bedrock:logging", line_number=0,
+                    code_snippet="",
+                    message="Model invocation logging not configured — no audit trail for AI inference",
+                    recommendation="Enable model invocation logging to S3 and CloudWatch.",
+                ))
+        except json.JSONDecodeError:
+            pass
+
+    def _check_logging_cli(self, collector: Collector):
+        """Check model invocation logging via CLI."""
+        print("  [AUTH-AWS] Auditing model invocation logging (CLI)...")
+        
+        success, stdout, error = _safe_cli_call(
+            ["aws", "bedrock", "get-model-invocation-logging-configuration", "--output", "json"]
+        )
+        
+        if not success:
+            collector.add_permission_issue("cli_logging_config", "bedrock:GetModelInvocationLoggingConfiguration", error)
+            collector.add_skipped_check("cli_logging_config")
+            return
+        
+        collector.add_completed_check("cli_logging_config")
+        
+        try:
+            data = json.loads(stdout)
+            logging_cfg = data.get("loggingConfig", {})
+            
+            cw_cfg = logging_cfg.get("cloudWatchConfig", {})
+            s3_cfg = logging_cfg.get("s3Config", {})
+            
+            if not cw_cfg.get("logGroupName") and not s3_cfg.get("bucketName"):
+                collector.add_finding(Finding(
+                    rule_id="AUTH-AWS-LOG-001", severity=Severity.CRITICAL,
+                    category="logging", cloud_env="aws",
+                    file_path="live:bedrock:logging", line_number=0,
+                    code_snippet="",
+                    message="Model invocation logging not configured — no audit trail for AI inference",
+                    recommendation="Enable model invocation logging to S3 and CloudWatch.",
+                ))
+        except json.JSONDecodeError:
+            pass
 
     # ── Guardrails ──────────────────────────────────────────────────
     def _check_guardrails(self, bedrock, collector: Collector):
@@ -101,6 +412,9 @@ class AWSAuthScanner:
                 owasp_llm="LLM01: Prompt Injection",
             ))
             return
+
+        # Mark that we have default guardrails
+        self._has_default_guardrails = True
 
         print(f"  [AUTH-AWS] Found {len(guardrails)} guardrail(s)")
         for gr in guardrails:
