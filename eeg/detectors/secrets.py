@@ -1,5 +1,5 @@
 """EEG - Secrets & Credential Exposure Detector"""
-from eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.base import BaseDetector
 
 
 class SecretsDetector(BaseDetector):

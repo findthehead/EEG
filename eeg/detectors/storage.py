@@ -1,5 +1,5 @@
 """EEG - Storage Security Detector (S3, Blob, GCS)"""
-from eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.base import BaseDetector
 
 
 class StorageDetector(BaseDetector):

@@ -1,5 +1,5 @@
 """EEG - Infrastructure as Code Detector (Terraform, Bicep, CloudFormation)"""
-from eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.base import BaseDetector
 
 
 class IaCDetector(BaseDetector):

@@ -1,5 +1,5 @@
 """EEG - AI Guardrail Configuration Detector"""
-from eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.base import BaseDetector
 
 
 class GuardrailDetector(BaseDetector):

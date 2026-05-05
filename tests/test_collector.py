@@ -3,7 +3,7 @@ Tests for the Collector module.
 """
 
 import pytest
-from eeg.collector import Collector, Finding, Severity
+from EEG.eeg.collector import Collector, Finding, Severity
 
 
 class TestSeverity:

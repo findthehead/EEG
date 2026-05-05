@@ -5,11 +5,11 @@ Tests for detector modules.
 import os
 import pytest
 
-from eeg.collector import Collector, Severity
-from eeg.detectors.base import BaseDetector
-from eeg.detectors.iam import IAMDetector
-from eeg.detectors.guardrail import GuardrailDetector
-from eeg.detectors.prompt import PromptDetector
+from EEG.eeg.collector import Collector, Severity
+from EEG.eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.iam import IAMDetector
+from EEG.eeg.detectors.guardrail import GuardrailDetector
+from EEG.eeg.detectors.prompt import PromptDetector
 
 
 class TestBaseDetector:

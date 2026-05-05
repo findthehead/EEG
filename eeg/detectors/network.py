@@ -1,5 +1,5 @@
 """EEG - Network Exposure Detector"""
-from eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.base import BaseDetector
 
 
 class NetworkDetector(BaseDetector):

@@ -14,6 +14,7 @@ Usage:
   python eeg.py --env azure --auth true --path ./my-app --avoid iac,network --report html
   python eeg.py --env gcp --vm false --thread max --report csv
   python eeg.py --env azure --console-mode auto --path . --report html
+  python eeg.py --env aws --path ./app --report csv,html,json  # Multiple formats
 """
 
 import argparse
@@ -22,18 +23,18 @@ import os
 import time
 import datetime
 
-from eeg.collector import Collector, Severity
-from eeg.utils.repocrawler import RepoCrawler
-from eeg.utils.threadpoolexecutor import ThreadManager
-from eeg.utils.htmlreport import HTMLReportGenerator
-from eeg.utils.jsonreport import JSONReportGenerator
-from eeg.utils.csvreport import CSVReportGenerator
-from eeg.utils.auth import CloudAuthenticator
-from eeg.utils.cloud_console import CloudConsoleDetector, LocalConsoleAuthenticator
-from eeg.detectors import load_detectors
-from eeg.auth_scanner import get_auth_scanner
-from eeg.vuln_manager.cve_fetcher import CVEFetcher
-from eeg.vuln_manager.dependency_parser import DependencyParser
+from EEG.eeg.collector import Collector, Severity
+from EEG.eeg.utils.repocrawler import RepoCrawler
+from EEG.eeg.utils.threadpoolexecutor import ThreadManager
+from EEG.eeg.utils.htmlreport import HTMLReportGenerator
+from EEG.eeg.utils.jsonreport import JSONReportGenerator
+from EEG.eeg.utils.csvreport import CSVReportGenerator
+from EEG.eeg.utils.auth import CloudAuthenticator
+from EEG.eeg.utils.cloud_console import CloudConsoleDetector, LocalConsoleAuthenticator
+from EEG.eeg.detectors import load_detectors
+from EEG.eeg.auth_scanner import get_auth_scanner
+from EEG.eeg.vuln_manager.cve_fetcher import CVEFetcher
+from EEG.eeg.vuln_manager.dependency_parser import DependencyParser
 
 
 BANNER = """
@@ -58,6 +59,8 @@ Examples:
   %(prog)s --env gcp --path ./vertex-app --avoid iac,network --vm false
   %(prog)s --env aws --path ./app --thread max --report csv
   %(prog)s --env azure --console-mode auto --path . --report html
+  %(prog)s --env aws --path ./app --report csv,html,json
+  %(prog)s --env azure --path ./app --report html,json --output-file my-report
         """,
     )
 
@@ -104,13 +107,12 @@ Examples:
     parser.add_argument(
         "--report",
         default="json",
-        choices=["json", "html", "csv"],
-        help="Report output format: json, html, or csv. Default: json",
+        help="Report output format(s). Comma-separated: json,html,csv. Examples: --report html or --report csv,html,json. Default: json",
     )
     parser.add_argument(
         "--output-file",
         default=None,
-        help="Save report to file (default: auto-generated filename based on format)",
+        help="Base filename for report(s). Extension will be added automatically. Default: auto-generated",
     )
 
     return parser.parse_args()
@@ -125,8 +127,20 @@ def main():
     vm_enabled = args.vm == "true"
     avoid_categories = set(c.strip().lower() for c in args.avoid.split(",") if c.strip())
     thread_level = args.thread or "min"
-    report_format = args.report
     console_mode = args.console_mode
+    
+    # Parse report formats (comma-separated)
+    valid_formats = {"json", "html", "csv"}
+    report_formats = [fmt.strip().lower() for fmt in args.report.split(",") if fmt.strip()]
+    invalid_formats = [fmt for fmt in report_formats if fmt not in valid_formats]
+    if invalid_formats:
+        print(f"[ERROR] Invalid report format(s): {', '.join(invalid_formats)}. Valid options: json, html, csv")
+        sys.exit(3)
+    if not report_formats:
+        report_formats = ["json"]  # Default
+    # Remove duplicates while preserving order
+    report_formats = list(dict.fromkeys(report_formats))
+    print(f"[CONFIG] Report format(s): {', '.join(report_formats)}")
 
     # Determine if we need a path (static scanning) or can run live-only
     repo_path = None
@@ -292,29 +306,41 @@ def main():
         print("    (Some checks skipped due to limited permissions)")
     print("=" * 60)
 
-    if report_format == "json":
-        generator = JSONReportGenerator(collector)
-    elif report_format == "csv":
-        generator = CSVReportGenerator(collector)
-    else:
-        generator = HTMLReportGenerator(collector)
+    # Generate reports for each requested format
+    app_name = os.path.basename(repo_path)
+    ts = datetime.datetime.utcnow().strftime("%H-%M-%S-%d%m%Y")
+    base_output = args.output_file
+    
+    generated_reports = []
+    for report_format in report_formats:
+        if report_format == "json":
+            generator = JSONReportGenerator(collector)
+        elif report_format == "csv":
+            generator = CSVReportGenerator(collector)
+        else:
+            generator = HTMLReportGenerator(collector)
 
-    report_content = generator.generate()
+        report_content = generator.generate()
 
-    output_file = args.output_file
-    if output_file is None:
-        app_name = os.path.basename(repo_path)
-        ts = datetime.datetime.utcnow().strftime("%H-%M-%S-%d%m%Y")
-        ext_map = {"html": "html", "json": "json", "csv": "csv"}
-        ext = ext_map.get(report_format, "json")
-        output_file = f"eeg-report-{cloud_env}-{app_name}-{ts}.{ext}"
+        # Determine output filename
+        if base_output:
+            # User provided base name - add extension
+            if base_output.endswith(f".{report_format}"):
+                output_file = base_output
+            else:
+                # Strip any existing extension and add correct one
+                base_name = base_output.rsplit(".", 1)[0] if "." in base_output else base_output
+                output_file = f"{base_name}.{report_format}"
+        else:
+            output_file = f"eeg-report-{cloud_env}-{app_name}-{ts}.{report_format}"
 
-    if output_file:
         with open(output_file, "w") as f:
             f.write(report_content)
-        print(f"\n[REPORT] Saved to: {output_file}")
-    else:
-        print("\n" + report_content)
+        generated_reports.append(output_file)
+    
+    print(f"\n[REPORT] Generated {len(generated_reports)} report(s):")
+    for report_file in generated_reports:
+        print(f"         - {report_file}")
 
     exit_code = collector.exit_code
     if exit_code == 2:

@@ -4,9 +4,9 @@ Tests for vulnerability management modules.
 
 import pytest
 
-from eeg.vuln_manager.dependency_parser import DependencyParser, AI_PACKAGE_REGISTRY
-from eeg.vuln_manager.cve_fetcher import CVEFetcher, CVSS_TO_SEVERITY
-from eeg.collector import Severity
+from EEG.eeg.vuln_manager.dependency_parser import DependencyParser, AI_PACKAGE_REGISTRY
+from EEG.eeg.vuln_manager.cve_fetcher import CVEFetcher, CVSS_TO_SEVERITY
+from EEG.eeg.collector import Severity
 
 
 class TestDependencyParser:

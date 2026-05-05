@@ -1,5 +1,5 @@
 """EEG - IAM Misconfiguration Detector"""
-from eeg.detectors.base import BaseDetector
+from EEG.eeg.detectors.base import BaseDetector
 
 
 class IAMDetector(BaseDetector):
