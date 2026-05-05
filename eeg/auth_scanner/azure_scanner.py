@@ -250,7 +250,13 @@ class AzureAuthScanner:
     def _check_network_cli(self, name: str, rg: str, details: Dict, collector: Collector):
         """Check network security configuration."""
         collector.add_completed_check(f"network_check_{name}")
+        
+        # Ensure details is a dict
+        if not isinstance(details, dict):
+            return
         props = details.get("properties", {})
+        if not isinstance(props, dict):
+            props = {}
         
         # Public network access
         public_access = props.get("publicNetworkAccess", "Enabled")
@@ -278,7 +284,7 @@ class AzureAuthScanner:
 
         # Network ACLs
         network_acls = props.get("networkAcls", {})
-        if network_acls:
+        if network_acls and isinstance(network_acls, dict):
             default_action = network_acls.get("defaultAction", "Allow")
             if default_action == "Allow":
                 collector.add_finding(Finding(
@@ -303,8 +309,15 @@ class AzureAuthScanner:
             collector.add_completed_check(f"iam_check_{name}")
             try:
                 assignments = json.loads(stdout)
+                # Handle both list and dict responses
+                if isinstance(assignments, dict):
+                    assignments = assignments.get("value", [])
+                if not isinstance(assignments, list):
+                    assignments = []
                 # Check for overly permissive assignments
                 for assignment in assignments:
+                    if not isinstance(assignment, dict):
+                        continue
                     role = assignment.get("role", "")
                     principal_type = assignment.get("type", "")
                     
@@ -328,18 +341,19 @@ class AzureAuthScanner:
 
         # Check local auth (API key) status from existing details
         details = self._cli_get_resource_details(name, rg, collector)
-        if details:
+        if details and isinstance(details, dict):
             props = details.get("properties", {})
-            disable_local_auth = props.get("disableLocalAuth", False)
-            if not disable_local_auth:
-                collector.add_finding(Finding(
-                    rule_id="AUTH-AZ-IAM-001", severity=Severity.HIGH,
-                    category="iam", cloud_env="azure",
-                    file_path=f"live:cognitive:{name}", line_number=0,
-                    code_snippet=f"disableLocalAuth={disable_local_auth}",
-                    message=f"Azure AI account '{name}' allows API key authentication (local auth enabled)",
-                    recommendation="Set disableLocalAuth=true. Use Managed Identity (Azure AD) for authentication instead of API keys.",
-                ))
+            if isinstance(props, dict):
+                disable_local_auth = props.get("disableLocalAuth", False)
+                if not disable_local_auth:
+                    collector.add_finding(Finding(
+                        rule_id="AUTH-AZ-IAM-001", severity=Severity.HIGH,
+                        category="iam", cloud_env="azure",
+                        file_path=f"live:cognitive:{name}", line_number=0,
+                        code_snippet=f"disableLocalAuth={disable_local_auth}",
+                        message=f"Azure AI account '{name}' allows API key authentication (local auth enabled)",
+                        recommendation="Set disableLocalAuth=true. Use Managed Identity (Azure AD) for authentication instead of API keys.",
+                    ))
 
     def _check_diagnostics_cli(self, name: str, rg: str, resource_id: str, collector: Collector):
         """Check diagnostic settings for logging and monitoring."""
@@ -360,7 +374,13 @@ class AzureAuthScanner:
         except json.JSONDecodeError:
             return
         
-        if not settings.get("value", []):
+        # Handle both list and dict responses from Azure CLI
+        if isinstance(settings, list):
+            settings_list = settings
+        else:
+            settings_list = settings.get("value", [])
+        
+        if not settings_list:
             collector.add_finding(Finding(
                 rule_id="AUTH-AZ-LOG-001", severity=Severity.HIGH,
                 category="logging", cloud_env="azure",
@@ -374,8 +394,12 @@ class AzureAuthScanner:
             has_audit = False
             has_request_response = False
             
-            for setting in settings.get("value", []):
+            for setting in settings_list:
+                if not isinstance(setting, dict):
+                    continue
                 for log in setting.get("logs", []):
+                    if not isinstance(log, dict):
+                        continue
                     if log.get("enabled"):
                         category = log.get("category", "")
                         if "Audit" in category:
@@ -422,9 +446,19 @@ class AzureAuthScanner:
         except json.JSONDecodeError:
             return
         
+        # Handle both list and dict responses
+        if isinstance(deployments, dict):
+            deployments = deployments.get("value", [])
+        if not isinstance(deployments, list):
+            return
+        
         for dep in deployments:
+            if not isinstance(dep, dict):
+                continue
             dep_name = dep.get("name", "")
             props = dep.get("properties", {})
+            if not isinstance(props, dict):
+                props = {}
             
             # Check for RAI policy (content filter)
             rai_policy = props.get("raiPolicyName") or props.get("contentFilter")
@@ -445,11 +479,19 @@ class AzureAuthScanner:
         Check if the project/resource has default guardrails configured.
         This is a key finding that indicates whether AI safety is properly configured.
         """
-        props = details.get("properties", {})
+        props = details.get("properties", {}) if isinstance(details, dict) else {}
+        if not isinstance(props, dict):
+            props = {}
         capabilities = props.get("capabilities", [])
         
-        # Extract capability names
-        cap_names = [c.get("name", "") for c in capabilities] if isinstance(capabilities, list) else []
+        # Extract capability names - handle both list of dicts and other formats
+        cap_names = []
+        if isinstance(capabilities, list):
+            for c in capabilities:
+                if isinstance(c, dict):
+                    cap_names.append(c.get("name", ""))
+                elif isinstance(c, str):
+                    cap_names.append(c)
         
         # Check for default content moderation capabilities
         safety_caps = ["ContentSafety", "TextModeration", "ImageModeration", "Hate", "SelfHarm", "Sexual", "Violence"]
