@@ -6,7 +6,7 @@ import pytest
 import sys
 from unittest.mock import patch
 
-from EEG.eeg.cli import parse_args
+from eeg.cli import parse_args
 
 
 class TestCLIArguments:

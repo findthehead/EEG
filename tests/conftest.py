@@ -7,7 +7,7 @@ import os
 import tempfile
 import pytest
 
-from EEG.eeg.collector import Collector
+from eeg.collector import Collector
 
 
 @pytest.fixture

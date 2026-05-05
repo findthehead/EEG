@@ -5,8 +5,8 @@ Tests for utility modules.
 import os
 import pytest
 
-from EEG.eeg.utils.cloud_console import CloudConsoleDetector, LocalConsoleAuthenticator
-from EEG.eeg.utils.repocrawler import RepoCrawler
+from eeg.utils.cloud_console import CloudConsoleDetector, LocalConsoleAuthenticator
+from eeg.utils.repocrawler import RepoCrawler
 
 
 class TestCloudConsoleDetector:
