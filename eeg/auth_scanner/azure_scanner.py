@@ -98,7 +98,6 @@ class AzureAuthScanner:
         """Scan using Azure Python SDK."""
         try:
             credential = DefaultAzureCredential()
-            cog_client = CognitiveServicesManagementClient(credential, self.subscription_id)
             collector.add_completed_check("azure_sdk_auth")
         except Exception as e:
             collector.add_permission_issue("azure_sdk_auth", "credential", str(e))
@@ -106,7 +105,30 @@ class AzureAuthScanner:
             self._scan_with_cli(collector)
             return
 
-        self._check_cognitive_accounts_sdk(cog_client, collector, credential)
+        # Get all subscriptions to audit
+        subscriptions = self._cli_get_subscriptions(collector)
+        if not subscriptions:
+            subscriptions = [self.subscription_id] if self.subscription_id else []
+
+        if not subscriptions:
+            print("  [AUTH-AZ] ⚠ No subscriptions accessible - check permissions")
+            return
+
+        print(f"  [AUTH-AZ] Will audit {len(subscriptions)} subscription(s) using SDK...")
+
+        for sub in subscriptions:
+            if not sub:
+                continue
+            print(f"  [AUTH-AZ] Auditing subscription: {sub}")
+            
+            try:
+                cog_client = CognitiveServicesManagementClient(credential, sub)
+                self._check_cognitive_accounts_sdk(cog_client, collector, credential, sub)
+                print(f"  [AUTH-AZ] Completed subscription: {sub}")
+            except Exception as e:
+                print(f"  [AUTH-AZ] ⚠ Error auditing subscription {sub}: {str(e)[:100]} - continuing to next subscription")
+                collector.add_permission_issue(f"sdk_audit_subscription_{sub}", sub, str(e)[:150])
+                continue
 
     def _scan_with_cli(self, collector: Collector):
         """Scan using Azure CLI commands (for cloud shell and CLI-only environments)."""
@@ -126,38 +148,53 @@ class AzureAuthScanner:
                 continue
             print(f"  [AUTH-AZ] Auditing subscription: {sub}")
             
-            if not self._cli_set_subscription(sub, collector):
-                continue
-            
-            # Audit AI resources
-            resources = self._cli_get_ai_resources(collector)
-            if not resources:
-                print(f"  [AUTH-AZ] No AI resources found or accessible in subscription {sub}")
-                continue
-
-            print(f"  [AUTH-AZ] Found {len(resources)} AI resource(s)")
-
-            for resource in resources:
-                name = resource.get("name", "")
-                rg = resource.get("resourceGroup", "")
-                resource_id = resource.get("id", "")
+            try:
+                if not self._cli_set_subscription(sub, collector):
+                    print(f"  [AUTH-AZ] ⚠ Failed to set subscription {sub} - continuing to next subscription")
+                    continue
                 
-                if not name or not rg:
+                # Audit AI resources
+                resources = self._cli_get_ai_resources(collector)
+                if not resources:
+                    print(f"  [AUTH-AZ] No AI resources found or accessible in subscription {sub}")
                     continue
 
-                print(f"    > Auditing: {name}")
-                
-                # Get detailed resource info
-                details = self._cli_get_resource_details(name, rg, collector)
-                if not details:
-                    continue
+                print(f"  [AUTH-AZ] Found {len(resources)} AI resource(s)")
 
-                # Run all checks - each handles its own permissions gracefully
-                self._check_network_cli(name, rg, details, collector)
-                self._check_iam_cli(name, rg, resource_id, collector)
-                self._check_diagnostics_cli(name, rg, resource_id, collector)
-                self._check_deployments_cli(name, rg, collector)
-                self._check_default_guardrails_cli(name, rg, details, collector)
+                for resource in resources:
+                    name = resource.get("name", "")
+                    rg = resource.get("resourceGroup", "")
+                    resource_id = resource.get("id", "")
+                    
+                    if not name or not rg:
+                        continue
+
+                    print(f"    > Auditing: {name}")
+                    
+                    try:
+                        # Get detailed resource info
+                        details = self._cli_get_resource_details(name, rg, collector)
+                        if not details:
+                            print(f"    > Skipping {name} - unable to get details, continuing to next resource")
+                            continue
+
+                        # Run all checks - each handles its own permissions gracefully
+                        self._check_network_cli(name, rg, details, collector)
+                        self._check_iam_cli(name, rg, resource_id, collector)
+                        self._check_diagnostics_cli(name, rg, resource_id, collector)
+                        self._check_deployments_cli(name, rg, collector)
+                        self._check_default_guardrails_cli(name, rg, details, collector)
+                    except Exception as e:
+                        print(f"    > Error auditing {name}: {str(e)[:100]} - continuing to next resource")
+                        collector.add_permission_issue(f"audit_resource_{name}", f"{rg}/{name}", str(e)[:150])
+                        continue
+                        
+                print(f"  [AUTH-AZ] Completed subscription: {sub}")
+                
+            except Exception as e:
+                print(f"  [AUTH-AZ] ⚠ Error auditing subscription {sub}: {str(e)[:100]} - continuing to next subscription")
+                collector.add_permission_issue(f"audit_subscription_{sub}", sub, str(e)[:150])
+                continue
 
     # ── CLI Helper Methods with Permission Handling ─────────────────
     def _cli_get_subscriptions(self, collector: Collector) -> List[str]:
@@ -463,97 +500,105 @@ class AzureAuthScanner:
             ))
 
     # ── SDK Methods (when azure-mgmt is available) ──────────────────
-    def _check_cognitive_accounts_sdk(self, cog_client, collector: Collector, credential):
+    def _check_cognitive_accounts_sdk(self, cog_client, collector: Collector, credential, subscription_id: str = ""):
         """Audit all Cognitive Services accounts using SDK."""
-        print("  [AUTH-AZ] Auditing Cognitive Services accounts (SDK mode)...")
+        sub_label = f" in subscription {subscription_id}" if subscription_id else ""
+        print(f"  [AUTH-AZ] Auditing Cognitive Services accounts{sub_label} (SDK mode)...")
 
         try:
             accounts = list(cog_client.accounts.list())
         except Exception as e:
-            print(f"  [AUTH-AZ] Cannot list accounts: {e}")
+            print(f"  [AUTH-AZ] Cannot list accounts{sub_label}: {e}")
             return
 
         ai_accounts = [a for a in accounts if a.kind in ("OpenAI", "AIServices", "CognitiveServices")]
-        print(f"  [AUTH-AZ] Found {len(ai_accounts)} AI service account(s)")
+        print(f"  [AUTH-AZ] Found {len(ai_accounts)} AI service account(s){sub_label}")
 
         for account in ai_accounts:
             name = account.name
             rg = account.id.split("/")[4] if account.id else "unknown"
-            props = account.properties or {}
-
-            # Public network access
-            public_access = props.public_network_access or "Enabled"
-            if public_access == "Enabled":
-                collector.add_finding(Finding(
-                    rule_id="AUTH-AZ-NET-001", severity=Severity.HIGH,
-                    category="network", cloud_env="azure",
-                    file_path=f"live:cognitive:{name}", line_number=0,
-                    code_snippet=f"publicNetworkAccess={public_access}",
-                    message=f"Azure AI account '{name}' has public network access enabled",
-                    recommendation="Disable public network access. Use private endpoints for all AI service connections.",
-                ))
-
-            # Local auth (API key) enabled
-            disable_local_auth = props.disable_local_auth
-            if not disable_local_auth:
-                collector.add_finding(Finding(
-                    rule_id="AUTH-AZ-IAM-001", severity=Severity.HIGH,
-                    category="iam", cloud_env="azure",
-                    file_path=f"live:cognitive:{name}", line_number=0,
-                    code_snippet=f"disableLocalAuth={disable_local_auth}",
-                    message=f"Azure AI account '{name}' allows API key authentication (local auth enabled)",
-                    recommendation="Set disableLocalAuth=true. Use Managed Identity (Azure AD) for authentication instead of API keys.",
-                ))
-
-            # Encryption — customer managed key
-            encryption = account.properties.encryption if hasattr(account.properties, 'encryption') else None
-            if not encryption or not getattr(encryption, 'key_vault_properties', None):
-                collector.add_finding(Finding(
-                    rule_id="AUTH-AZ-MODEL-001", severity=Severity.MEDIUM,
-                    category="model", cloud_env="azure",
-                    file_path=f"live:cognitive:{name}", line_number=0,
-                    code_snippet="encryption=Microsoft-managed",
-                    message=f"Azure AI account '{name}' uses Microsoft-managed keys (no CMK)",
-                    recommendation="Configure customer-managed encryption keys (CMK) via Azure Key Vault for sensitive AI workloads.",
-                ))
-
-            # Network ACLs
-            network_acls = props.network_acls
-            if network_acls:
-                default_action = getattr(network_acls, 'default_action', 'Allow')
-                if default_action == "Allow":
+            
+            try:
+                props = account.properties or {}
+                
+                # Public network access
+                public_access = props.public_network_access or "Enabled"
+                if public_access == "Enabled":
                     collector.add_finding(Finding(
-                        rule_id="AUTH-AZ-NET-003", severity=Severity.HIGH,
+                        rule_id="AUTH-AZ-NET-001", severity=Severity.HIGH,
                         category="network", cloud_env="azure",
                         file_path=f"live:cognitive:{name}", line_number=0,
-                        code_snippet=f"networkAcls.defaultAction={default_action}",
-                        message=f"Azure AI account '{name}' network ACLs default to Allow",
-                        recommendation="Set network ACLs defaultAction to Deny. Whitelist specific IPs and VNet subnets.",
+                        code_snippet=f"publicNetworkAccess={public_access}",
+                        message=f"Azure AI account '{name}' has public network access enabled",
+                        recommendation="Disable public network access. Use private endpoints for all AI service connections.",
                     ))
 
-            # Check deployments for content filter configuration
-            try:
-                deployments = list(cog_client.deployments.list(rg, name))
-                for dep in deployments:
-                    dep_name = dep.name
-                    dep_props = dep.properties or {}
-                    # Content filter presence
-                    rai_policy = getattr(dep_props, 'rai_policy_name', None) or getattr(dep_props, 'content_filter', None)
-                    if not rai_policy:
+                # Local auth (API key) enabled
+                disable_local_auth = props.disable_local_auth
+                if not disable_local_auth:
+                    collector.add_finding(Finding(
+                        rule_id="AUTH-AZ-IAM-001", severity=Severity.HIGH,
+                        category="iam", cloud_env="azure",
+                        file_path=f"live:cognitive:{name}", line_number=0,
+                        code_snippet=f"disableLocalAuth={disable_local_auth}",
+                        message=f"Azure AI account '{name}' allows API key authentication (local auth enabled)",
+                        recommendation="Set disableLocalAuth=true. Use Managed Identity (Azure AD) for authentication instead of API keys.",
+                    ))
+
+                # Encryption — customer managed key
+                encryption = account.properties.encryption if hasattr(account.properties, 'encryption') else None
+                if not encryption or not getattr(encryption, 'key_vault_properties', None):
+                    collector.add_finding(Finding(
+                        rule_id="AUTH-AZ-MODEL-001", severity=Severity.MEDIUM,
+                        category="model", cloud_env="azure",
+                        file_path=f"live:cognitive:{name}", line_number=0,
+                        code_snippet="encryption=Microsoft-managed",
+                        message=f"Azure AI account '{name}' uses Microsoft-managed keys (no CMK)",
+                        recommendation="Configure customer-managed encryption keys (CMK) via Azure Key Vault for sensitive AI workloads.",
+                    ))
+
+                # Network ACLs
+                network_acls = props.network_acls
+                if network_acls:
+                    default_action = getattr(network_acls, 'default_action', 'Allow')
+                    if default_action == "Allow":
                         collector.add_finding(Finding(
-                            rule_id="AUTH-AZ-GUARD-001", severity=Severity.CRITICAL,
-                            category="guardrail", cloud_env="azure",
-                            file_path=f"live:deployment:{name}/{dep_name}", line_number=0,
-                            code_snippet="raiPolicyName=null",
-                            message=f"Deployment '{dep_name}' on '{name}' has no content filter / RAI policy attached",
-                            recommendation="Attach a Responsible AI content filter policy with jailbreak detection, hate/violence/sexual/self-harm filtering.",
-                            owasp_llm="LLM01: Prompt Injection",
+                            rule_id="AUTH-AZ-NET-003", severity=Severity.HIGH,
+                            category="network", cloud_env="azure",
+                            file_path=f"live:cognitive:{name}", line_number=0,
+                            code_snippet=f"networkAcls.defaultAction={default_action}",
+                            message=f"Azure AI account '{name}' network ACLs default to Allow",
+                            recommendation="Set network ACLs defaultAction to Deny. Whitelist specific IPs and VNet subnets.",
                         ))
-            except Exception:
-                pass
-            
-            # Check default guardrails (SDK mode)
-            self._check_default_guardrails_sdk(name, props, collector)
+
+                # Check deployments for content filter configuration
+                try:
+                    deployments = list(cog_client.deployments.list(rg, name))
+                    for dep in deployments:
+                        dep_name = dep.name
+                        dep_props = dep.properties or {}
+                        # Content filter presence
+                        rai_policy = getattr(dep_props, 'rai_policy_name', None) or getattr(dep_props, 'content_filter', None)
+                        if not rai_policy:
+                            collector.add_finding(Finding(
+                                rule_id="AUTH-AZ-GUARD-001", severity=Severity.CRITICAL,
+                                category="guardrail", cloud_env="azure",
+                                file_path=f"live:deployment:{name}/{dep_name}", line_number=0,
+                                code_snippet="raiPolicyName=null",
+                                message=f"Deployment '{dep_name}' on '{name}' has no content filter / RAI policy attached",
+                                recommendation="Attach a Responsible AI content filter policy with jailbreak detection, hate/violence/sexual/self-harm filtering.",
+                                owasp_llm="LLM01: Prompt Injection",
+                            ))
+                except Exception:
+                    pass
+                
+                # Check default guardrails (SDK mode)
+                self._check_default_guardrails_sdk(name, props, collector)
+                
+            except Exception as e:
+                print(f"  [AUTH-AZ] Error auditing account {name}: {str(e)[:100]} - continuing to next account")
+                collector.add_permission_issue(f"audit_account_{name}", name, str(e)[:150])
+                continue
 
     def _check_default_guardrails_sdk(self, name: str, props, collector: Collector):
         """Check for default guardrails using SDK properties."""
